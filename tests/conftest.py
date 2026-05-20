@@ -1,14 +1,29 @@
 import importlib
-from pdb import run
-import sys
+import os
 import re
+import shlex
+import subprocess
+import tempfile
 from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
+from tkinter import E
+from typing import Callable
 
 import pytest
 
 LINE_PATTERN = re.compile(r"^\[line (\d+)\] ")
+REPO_BASE = Path(__file__).parent.parent
+
+type EntryPointFn = Callable[[str], tuple[str, Exception | None]]
+
+ENTRY_POINTS: list[EntryPointFn] = [
+    lambda src: run_program_from_entrypoint(src), 
+    lambda src: run_program_from_lox_class(src),
+    lambda src: run_program_from_entrypoint(src, entrypoint="lox:interpret"), 
+    lambda src: run_program_from_entrypoint(src, entrypoint="lox:execute"), 
+]
+
 
 class NotSupported(Exception):
     """Indicate that a feature is not supported."""
@@ -28,7 +43,7 @@ def check_program(section: str, name: str, /):
         def test_some_feature(check, name: str):
             check("some_section", name)
     """
-    base = Path(__file__).parent.parent / "examples"
+    base = REPO_BASE / "examples"
     if section:
         path = base / section / f"{name}.lox"
     else:
@@ -159,7 +174,7 @@ def run_program(source: str) -> tuple[str, Exception | None]:
     """
     Run a program source and return its output.
     """
-    for fn in [run_program_from_entrypoint, run_program_from_lox_class]:
+    for fn in ENTRY_POINTS:
         try:
             return fn(source)
         except NotSupported:
@@ -171,7 +186,7 @@ def run_program_from_lox_class(source: str) -> tuple[str, Exception | None]:
     Run a program source using the Lox class and return its output.
     """
     try:
-        from lox.__main__ import Lox
+        from lox.__main__ import Lox # type: ignore
     except ImportError:
         raise NotSupported("Lox class is not available in this implementation.")
     try:
@@ -197,7 +212,48 @@ def run_program_from_entrypoint(source: str, entrypoint: str = "lox:run_source")
         raise NotSupported(f"Entrypoint {entrypoint} is not available.")
     return from_runner(source, run_source)
 
-def from_runner(source: str, runner: str) -> tuple[str, Exception | None]:
+
+def run_program_from_executable(source: str) -> tuple[str, Exception | None]:
+    """
+    Run a program source using the executable and return its output.
+    """
+    executable = os.getenv("LOX_EXECUTABLE")
+    if executable is None:
+        if (path := REPO_BASE / ".lox-executable"). exists():
+            executable = path.read_text().strip()
+    
+    if executable is None:
+        raise NotSupported("Running from executable is not supported in this implementation.")
+    
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp) / "program.lox"
+        tmp_path.write_text(source, encoding="utf-8")
+
+        result = subprocess.run(
+            [executable, tmp_path],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    try:
+        result = subprocess.run(
+            [*shlex.split(executable), "-c", source],
+            capture_output=True,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+        )
+        output = result.stdout
+        if result.returncode != 0:
+            return output, RuntimeError(f"Process exited with code {result.returncode}")
+        err = None
+    except Exception as e:
+        output = ""
+        err = e
+    return output, err
+
+def from_runner(source: str, runner: Callable[[str], None]) -> tuple[str, Exception | None]:
     """
     Run a program source using the specified runner function and return its output.
     """
